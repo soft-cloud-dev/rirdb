@@ -3,30 +3,95 @@ on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
+
 permissions:
   contents: write
+
 concurrency:
   group: daily-rir-release
   cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
     steps:
       - uses: actions/checkout@v4
-      - name: Build merged data
-        run: bash scripts/merge-rir.sh dist
+
       - name: Set UTC release date
         id: date
         run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-      - name: Publish daily release
+
+      - name: Capture previous published build
+        id: previous
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: rir-${{ steps.date.outputs.day }}
         run: |
+          mkdir -p previous
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            PREVIOUS_TAG="$TAG"
+          else
+            PREVIOUS_TAG="$(
+              gh release list                 --limit 100                 --json tagName,isDraft,isPrerelease,publishedAt                 --jq '[.[] | select(.isDraft == false and .tagName != env.TAG and (.tagName | startswith("rir-")))] | sort_by(.publishedAt) | reverse | .[0].tagName // ""'
+            )"
+          fi
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            gh release download "$PREVIOUS_TAG"               --pattern delegated-rir-extended.txt.gz               --dir previous
+            gzip -dc previous/delegated-rir-extended.txt.gz > previous/delegated-rir-extended.txt
+            echo "tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=none" >> "$GITHUB_OUTPUT"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build merged data
+        run: bash scripts/merge-rir.sh dist
+
+      - name: Build release diff
+        env:
+          CURRENT_TAG: rir-${{ steps.date.outputs.day }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+          PREVIOUS_FOUND: ${{ steps.previous.outputs.found }}
+        run: |
+          if [ "$PREVIOUS_FOUND" = "true" ]; then
+            bash scripts/diff-rir.sh               previous/delegated-rir-extended.txt               dist/delegated-rir-extended.txt               dist               "$PREVIOUS_TAG"               "$CURRENT_TAG"
+          else
+            cp dist/delegated-rir-extended.txt previous/delegated-rir-extended.txt
+            bash scripts/diff-rir.sh               previous/delegated-rir-extended.txt               dist/delegated-rir-extended.txt               dist               "none"               "$CURRENT_TAG"
+          fi
+
+          rm -f dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum               delegated-rir-extended.txt               delegated-rir-extended.txt.gz               counts.txt               changes.txt               changes.txt.gz               changes-counts.txt               > SHA256SUMS
+          )
+
+      - name: Publish daily release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: rir-${{ steps.date.outputs.day }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          NOTES="$(cat <<EOF
+          Daily merged APNIC, ARIN, LACNIC, AFRINIC and RIPE NCC delegated extended data.
+
+          UTC snapshot date: ${{ steps.date.outputs.day }}
+          Compared with: $PREVIOUS_TAG
+
+          Change counts:
+          $(cat dist/changes-counts.txt)
+          EOF
+          )"
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists; updating its assets"
+            gh release edit "$TAG" --notes "$NOTES"
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* --title "RIR snapshot ${{ steps.date.outputs.day }}" --notes "Daily merged APNIC, ARIN, LACNIC, AFRINIC and RIPE NCC delegated extended data. UTC snapshot date: ${{ steps.date.outputs.day }}."
+            gh release create "$TAG" dist/*               --title "RIR snapshot ${{ steps.date.outputs.day }}"               --notes "$NOTES"
           fi
